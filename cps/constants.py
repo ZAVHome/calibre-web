@@ -23,8 +23,8 @@ from collections import namedtuple
 # APP_MODE - production, development, or test
 APP_MODE             = os.environ.get('APP_MODE', 'production')
 
-# if installed via pip this variable is set to true (empty file with name .HOMEDIR present)
-HOME_CONFIG = os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.HOMEDIR'))
+# Use user home directory ~/.calibre-web for app.db and settings
+HOME_CONFIG = True
 
 # In executables updater is not available, so variable is set to False there
 UPDATER_AVAILABLE = True
