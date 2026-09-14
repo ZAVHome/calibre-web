@@ -23,6 +23,9 @@
 import os
 from datetime import datetime, timezone
 import json
+import tempfile
+import hashlib
+import shutil
 from shutil import copyfile
 
 from markupsafe import escape, Markup  # dependency of flask
@@ -37,7 +40,7 @@ from sqlalchemy.exc import OperationalError, IntegrityError, InterfaceError
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql.expression import func
 
-from . import constants, logger, isoLanguages, gdriveutils, uploader, helper, kobo_sync_status
+from . import constants, logger, isoLanguages, gdriveutils, uploader, helper, kobo_sync_status, archive_helper
 from .clean_html import clean_string
 from . import config, ub, db, calibre_db
 from .services.worker import WorkerThread
@@ -46,7 +49,7 @@ from .render_template import render_title_template
 from .binary_helper import resolve_binary_path, SUPPORTED_UNRAR_BINARIES
 from .kobo_sync_status import change_archived_books
 from .redirect import get_redirect_location
-from .file_helper import validate_mime_type
+from .file_helper import validate_mime_type, get_temp_dir
 from .usermanagement import user_login_required, login_required_if_no_ano
 from .string_helper import strip_whitespaces
 
@@ -102,6 +105,47 @@ def edit_book(book_id):
     return do_edit_book(book_id)
 
 
+def process_single_book_on_upload(meta, modify_date=False):
+    db_book, input_authors, title_dir = create_book_on_upload(modify_date, meta)
+
+    # Comments need book id therefore only possible after flush
+    modify_date |= edit_book_comments(Markup(meta.description).unescape(), db_book)
+
+    book_id = db_book.id
+    title = db_book.title
+    if config.config_use_google_drive:
+        helper.upload_new_file_gdrive(book_id,
+                                      input_authors[0],
+                                      title,
+                                      title_dir,
+                                      meta.file_path,
+                                      meta.extension.lower())
+        for file_format in db_book.data:
+            file_format.name = (helper.get_valid_filename(title, chars=42) + ' - '
+                                + helper.get_valid_filename(input_authors[0], chars=42))
+    else:
+        error = helper.update_dir_structure(book_id,
+                                            config.get_book_path(),
+                                            input_authors[0],
+                                            meta.file_path,
+                                            title_dir + meta.extension.lower())
+        if error:
+            flash(error, category="error")
+    move_coverfile(meta, db_book)
+    if modify_date:
+        calibre_db.set_metadata_dirty(book_id)
+    # save data to database, reread data
+    calibre_db.session.commit()
+
+    if config.config_use_google_drive:
+        gdriveutils.updateGdriveCalibreFromLocal()
+    link = '<a href="{}">{}</a>'.format(url_for('web.show_book', book_id=book_id), escape(title))
+    upload_text = N_("File %(file)s uploaded", file=link)
+    WorkerThread.add(current_user.name, TaskUpload(upload_text, escape(title)))
+    helper.add_book_to_thumbnail_cache(book_id)
+    return book_id
+
+
 @editbook.route("/upload", methods=["POST"])
 @login_required_if_no_ano
 @upload_required
@@ -110,65 +154,84 @@ def upload():
         book_id = request.form.get('book_id', -1)
         return do_edit_book(book_id, request.files.getlist("btn-upload-format"))
     elif len(request.files.getlist("btn-upload")):
+        created_book_ids = []
+        rar_executable = resolve_binary_path(config.config_rarfile_location, SUPPORTED_UNRAR_BINARIES)
         for requested_file in request.files.getlist("btn-upload"):
             try:
                 modify_date = False
                 # create the function for sorting...
                 calibre_db.create_functions(config)
-                meta, error = file_handling_on_upload(requested_file)
-                if error:
-                    return error
 
-                db_book, input_authors, title_dir = create_book_on_upload(modify_date, meta)
+                is_zip = False
+                if requested_file.filename and '.' in requested_file.filename:
+                    ext = requested_file.filename.rsplit('.', 1)[-1].lower()
+                    if ext == 'zip':
+                        is_zip = True
 
-                # Comments need book id therefore only possible after flush
-                modify_date |= edit_book_comments(Markup(meta.description).unescape(), db_book)
+                if is_zip:
+                    allowed_extensions = [x.strip().lower() for x in config.config_upload_formats.split(',') if x.strip()]
+                    if 'zip' not in allowed_extensions:
+                        allowed_extensions.append('zip')
+                    if config.config_check_extensions and not validate_mime_type(requested_file, allowed_extensions):
+                        flash(_("File type isn't allowed to be uploaded to this server"), category="error")
+                        continue
 
-                book_id = db_book.id
-                title = db_book.title
-                if config.config_use_google_drive:
-                    helper.upload_new_file_gdrive(book_id,
-                                                  input_authors[0],
-                                                  title,
-                                                  title_dir,
-                                                  meta.file_path,
-                                                  meta.extension.lower())
-                    for file_format in db_book.data:
-                        file_format.name = (helper.get_valid_filename(title, chars=42) + ' - '
-                                            + helper.get_valid_filename(input_authors[0], chars=42))
+                    temp_dir = get_temp_dir()
+                    zip_md5 = hashlib.md5(requested_file.filename.encode('utf-8')).hexdigest()
+                    zip_temp_path = os.path.join(temp_dir, f"upload_{zip_md5}.zip")
+                    requested_file.save(zip_temp_path)
+
+                    extract_dir = tempfile.mkdtemp(prefix="cw_zip_", dir=temp_dir)
+                    try:
+                        extracted_books = archive_helper.extract_books_from_zip(zip_temp_path, extract_dir)
+                        if not extracted_books:
+                            flash(_("No supported books found in archive %(filename)s", filename=requested_file.filename), category="warning")
+                        else:
+                            for book_item in extracted_books:
+                                meta = uploader.process(
+                                    book_item.path,
+                                    book_item.filename,
+                                    book_item.extension,
+                                    rar_executable=rar_executable
+                                )
+                                book_id = process_single_book_on_upload(meta, modify_date=False)
+                                created_book_ids.append(book_id)
+                    except archive_helper.ArchiveError as e:
+                        flash(_("Failed to process archive %(filename)s: %(error)s", filename=requested_file.filename, error=str(e)), category="error")
+                    finally:
+                        if os.path.exists(zip_temp_path):
+                            try:
+                                os.unlink(zip_temp_path)
+                            except OSError:
+                                pass
+                        if os.path.exists(extract_dir):
+                            try:
+                                shutil.rmtree(extract_dir, ignore_errors=True)
+                            except OSError:
+                                pass
                 else:
-                    error = helper.update_dir_structure(book_id,
-                                                        config.get_book_path(),
-                                                        input_authors[0],
-                                                        meta.file_path,
-                                                        title_dir + meta.extension.lower())
-                move_coverfile(meta, db_book)
-                if modify_date:
-                    calibre_db.set_metadata_dirty(book_id)
-                # save data to database, reread data
-                calibre_db.session.commit()
+                    meta, error = file_handling_on_upload(requested_file)
+                    if error:
+                        return error
+                    book_id = process_single_book_on_upload(meta, modify_date)
+                    created_book_ids.append(book_id)
 
-                if config.config_use_google_drive:
-                    gdriveutils.updateGdriveCalibreFromLocal()
-                if error:
-                    flash(error, category="error")
-                link = '<a href="{}">{}</a>'.format(url_for('web.show_book', book_id=book_id), escape(title))
-                upload_text = N_("File %(file)s uploaded", file=link)
-                WorkerThread.add(current_user.name, TaskUpload(upload_text, escape(title)))
-                helper.add_book_to_thumbnail_cache(book_id)
-
-                if len(request.files.getlist("btn-upload")) < 2:
-                    if current_user.role_edit() or current_user.role_admin():
-                        resp = {"location": url_for('edit-book.show_edit_book', book_id=book_id)}
-                        return make_response(jsonify(resp))
-                    else:
-                        resp = {"location": url_for('web.show_book', book_id=book_id)}
-                        return Response(json.dumps(resp), mimetype='application/json')
             except (OperationalError, IntegrityError, StaleDataError) as e:
                 calibre_db.session.rollback()
                 log.error_or_exception("Database error: {}".format(e))
                 flash(_("Oops! Database Error: %(error)s.", error=e.orig if hasattr(e, "orig") else e),
                       category="error")
+
+        if len(created_book_ids) == 1:
+            if current_user.role_edit() or current_user.role_admin():
+                resp = {"location": url_for('edit-book.show_edit_book', book_id=created_book_ids[0])}
+                return make_response(jsonify(resp))
+            else:
+                resp = {"location": url_for('web.show_book', book_id=created_book_ids[0])}
+                return Response(json.dumps(resp), mimetype='application/json')
+        elif len(created_book_ids) > 1:
+            flash(_("Successfully uploaded %(count)d books", count=len(created_book_ids)), category="success")
+
         return make_response(jsonify(location=url_for("web.index")))
     abort(404)
 
@@ -966,7 +1029,9 @@ def create_book_on_upload(modify_date, meta):
 
 def file_handling_on_upload(requested_file):
     # check if file extension is correct
-    allowed_extensions = config.config_upload_formats.split(',')
+    allowed_extensions = [x.strip().lower() for x in config.config_upload_formats.split(',') if x.strip()]
+    if 'zip' not in allowed_extensions:
+        allowed_extensions.append('zip')
     if requested_file:
         if config.config_check_extensions and allowed_extensions != ['']:
             if not validate_mime_type(requested_file, allowed_extensions):
@@ -1456,7 +1521,9 @@ def upload_book_formats(requested_files, book, book_id, no_cover=True):
     # Check and handle Uploaded file
     to_save = dict()
     error = False
-    allowed_extensions = config.config_upload_formats.split(',')
+    allowed_extensions = [x.strip().lower() for x in config.config_upload_formats.split(',') if x.strip()]
+    if 'zip' not in allowed_extensions:
+        allowed_extensions.append('zip')
     for requested_file in requested_files:
         current_filename = requested_file.filename
         if config.config_check_extensions and allowed_extensions != ['']:
@@ -1483,23 +1550,63 @@ def upload_book_formats(requested_files, book, book_id, no_cover=True):
 
             file_name = book.path.rsplit('/', 1)[-1]
             filepath = os.path.normpath(os.path.join(config.get_book_path(), book.path))
-            saved_filename = os.path.join(filepath, file_name + '.' + file_ext)
 
-            # check if file path exists, otherwise create it, copy file to calibre path and delete temp file
-            if not os.path.exists(filepath):
+            if file_ext == 'zip':
+                temp_dir = get_temp_dir()
+                zip_md5 = hashlib.md5(current_filename.encode('utf-8')).hexdigest()
+                zip_temp_path = os.path.join(temp_dir, f"format_{zip_md5}.zip")
+                requested_file.save(zip_temp_path)
+                extract_dir = tempfile.mkdtemp(prefix="cw_format_", dir=temp_dir)
                 try:
-                    os.makedirs(filepath)
-                except OSError:
-                    flash(_("Failed to create path %(path)s (Permission denied).", path=filepath),
-                          category="error")
+                    extracted_books = archive_helper.extract_books_from_zip(zip_temp_path, extract_dir)
+                    if not extracted_books:
+                        flash(_("No supported book formats found in archive %(filename)s", filename=current_filename), category="warning")
+                        error = True
+                        continue
+                    book_item = extracted_books[0]
+                    file_ext = book_item.extension.lstrip('.').lower()
+                    saved_filename = os.path.join(filepath, file_name + '.' + file_ext)
+                    if not os.path.exists(filepath):
+                        try:
+                            os.makedirs(filepath)
+                        except OSError:
+                            flash(_("Failed to create path %(path)s (Permission denied).", path=filepath),
+                                  category="error")
+                            error = True
+                            continue
+                    shutil.copyfile(book_item.path, saved_filename)
+                except archive_helper.ArchiveError as e:
+                    flash(_("Failed to process archive %(filename)s: %(error)s", filename=current_filename, error=str(e)), category="error")
                     error = True
                     continue
-            try:
-                requested_file.save(saved_filename)
-            except OSError:
-                flash(_("Failed to store file %(file)s.", file=saved_filename), category="error")
-                error = True
-                continue
+                finally:
+                    if os.path.exists(zip_temp_path):
+                        try:
+                            os.unlink(zip_temp_path)
+                        except OSError:
+                            pass
+                    if os.path.exists(extract_dir):
+                        try:
+                            shutil.rmtree(extract_dir, ignore_errors=True)
+                        except OSError:
+                            pass
+            else:
+                saved_filename = os.path.join(filepath, file_name + '.' + file_ext)
+                # check if file path exists, otherwise create it, copy file to calibre path and delete temp file
+                if not os.path.exists(filepath):
+                    try:
+                        os.makedirs(filepath)
+                    except OSError:
+                        flash(_("Failed to create path %(path)s (Permission denied).", path=filepath),
+                              category="error")
+                        error = True
+                        continue
+                try:
+                    requested_file.save(saved_filename)
+                except OSError:
+                    flash(_("Failed to store file %(file)s.", file=saved_filename), category="error")
+                    error = True
+                    continue
 
             file_size = os.path.getsize(saved_filename)
 

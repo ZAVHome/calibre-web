@@ -127,13 +127,15 @@ def get_sidebar_config(kwargs=None):
 
 # Returns the template for rendering and includes the instance name
 def render_title_template(*args, **kwargs):
-    sidebar, simple = get_sidebar_config(kwargs)
+    upload_formats = [f.strip().lower() for f in config.config_upload_formats.split(',') if f.strip()]
+    if 'zip' not in upload_formats:
+        upload_formats.append('zip')
     try:
         return themed_render(args[0],
                              instance=config.config_calibre_web_title,
                              sidebar=sidebar,
                              simple=simple,
-                             accept=config.config_upload_formats.split(','),
+                             accept=upload_formats,
                              **kwargs)
     except PermissionError:
         log.error("No permission to access {} file.".format(args[0]))
