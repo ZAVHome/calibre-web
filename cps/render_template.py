@@ -127,6 +127,7 @@ def get_sidebar_config(kwargs=None):
 
 # Returns the template for rendering and includes the instance name
 def render_title_template(*args, **kwargs):
+    sidebar, simple = get_sidebar_config(kwargs)
     upload_formats = [f.strip().lower() for f in config.config_upload_formats.split(',') if f.strip()]
     if 'zip' not in upload_formats:
         upload_formats.append('zip')
