@@ -77,7 +77,6 @@ def init_calibre_web(settings_path=None, calibre_dir=None):
     """Initializes Calibre-Web configuration and database connection."""
     from cps import cli_param, ub, config_sql, config, db
 
-    cli_param.init()
     if settings_path:
         cli_param.settings_path = os.path.abspath(settings_path)
     else:
