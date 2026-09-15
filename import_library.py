@@ -77,6 +77,11 @@ def init_calibre_web(settings_path=None, calibre_dir=None):
     """Initializes Calibre-Web configuration and database connection."""
     from cps import cli_param, ub, config_sql, config, db
 
+    cli_param.logpath = ""
+    cli_param.gd_path = ""
+    cli_param.certfilepath = None
+    cli_param.keyfilepath = None
+
     if settings_path:
         cli_param.settings_path = os.path.abspath(settings_path)
     else:
@@ -89,6 +94,8 @@ def init_calibre_web(settings_path=None, calibre_dir=None):
             f"Не найден файл настроек app.db! Укажите путь через параметр -p / --settings-path\n"
             f"Проверенные пути: {settings_path or 'стандартные пути ~/.calibre-web/app.db'}"
         )
+
+    cli_param.gd_path = os.path.join(os.path.dirname(cli_param.settings_path), "gdrive.db")
 
     print(f"[*] Файл настроек: {cli_param.settings_path}")
     ub.init_db(cli_param.settings_path)
@@ -305,6 +312,7 @@ def main():
         config = init_calibre_web(args.settings_path, args.calibre_dir)
     except Exception as e:
         print(f"[!] Ошибка инициализации: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
     from cps import app, calibre_db, helper, uploader, archive_helper
