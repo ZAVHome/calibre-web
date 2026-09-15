@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Batch Library Importer for Calibre-Web.
+
+Recursively scans a directory for books and archives (.zip, .fb2.zip, .fb2, .epub, .mobi, .pdf),
+extracts metadata (including Russian genres, series, covers, descriptions),
+detects duplicates with detailed file size comparisons,
+imports into Calibre library (metadata.db + file storage),
+and produces a comprehensive report.
+"""
+
+import os
+import sys
+import argparse
+import tempfile
+import shutil
+import hashlib
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Add project root to sys.path so we can import cps
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+SUPPORTED_ARCHIVES = {'.zip'}
+SUPPORTED_DIRECT_BOOKS = {'.fb2', '.epub', '.kepub', '.mobi', '.azw', '.azw3', '.prc', '.pdf'}
+
+
+def format_size(num_bytes):
+    """Formats bytes into human-readable string (e.g. 1.4 MB)."""
+    if num_bytes is None:
+        return "N/A"
+    try:
+        num_bytes = float(num_bytes)
+    except (ValueError, TypeError):
+        return str(num_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:3.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} TB"
+
+
+def is_service_running(service_name="calibre-web"):
+    """Checks if a systemd service is currently active."""
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service_name],
+            capture_output=True
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def find_default_settings():
+    """Tries to find Calibre-Web app.db in standard locations."""
+    from cps.constants import CONFIG_DIR, DEFAULT_SETTINGS_FILE
+    candidates = [
+        os.path.join(CONFIG_DIR, DEFAULT_SETTINGS_FILE),
+        os.path.expanduser("~/.calibre-web/app.db"),
+        "/home/bookserver/.calibre-web/app.db",
+        os.path.join(BASE_DIR, "app.db"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return None
+
+
+def init_calibre_web(settings_path=None, calibre_dir=None):
+    """Initializes Calibre-Web configuration and database connection."""
+    from cps import cli_param, ub, config_sql, config, db
+
+    cli_param.init()
+    if settings_path:
+        cli_param.settings_path = os.path.abspath(settings_path)
+    else:
+        found_settings = find_default_settings()
+        if found_settings:
+            cli_param.settings_path = found_settings
+
+    if not cli_param.settings_path or not os.path.isfile(cli_param.settings_path):
+        raise FileNotFoundError(
+            f"Не найден файл настроек app.db! Укажите путь через параметр -p / --settings-path\n"
+            f"Проверенные пути: {settings_path or 'стандартные пути ~/.calibre-web/app.db'}"
+        )
+
+    print(f"[*] Файл настроек: {cli_param.settings_path}")
+    ub.init_db(cli_param.settings_path)
+    encrypt_key, error = config_sql.get_encryption_key(os.path.dirname(cli_param.settings_path))
+    if error:
+        print(f"[!] Предупреждение шифрования: {error}")
+    config_sql.load_configuration(ub.session, encrypt_key)
+    config.init_config(ub.session, encrypt_key, cli_param)
+
+    if calibre_dir:
+        config.config_calibre_dir = os.path.abspath(calibre_dir)
+
+    if not config.config_calibre_dir or not os.path.exists(config.config_calibre_dir):
+        raise FileNotFoundError(
+            f"Каталог библиотеки Calibre не найден: {config.config_calibre_dir}.\n"
+            f"Укажите правильный путь через параметр -c / --calibre-dir"
+        )
+
+    metadata_path = os.path.join(config.config_calibre_dir, "metadata.db")
+    if not os.path.isfile(metadata_path):
+        raise FileNotFoundError(
+            f"Файл metadata.db не найден в {config.config_calibre_dir}!"
+        )
+
+    print(f"[*] Каталог библиотеки Calibre: {config.config_calibre_dir}")
+    db.CalibreDB.update_config(config, config.config_calibre_dir, cli_param.settings_path)
+    return config
+
+
+def import_single_book_to_db(meta, config, calibre_db, helper):
+    """
+    Imports a parsed BookMeta object into Calibre DB and moves file into library storage.
+    Returns the created Books object.
+    """
+    from markupsafe import Markup
+    from cps.editbooks import create_book_on_upload, edit_book_comments, move_coverfile
+
+    modify_date = False
+    calibre_db.create_functions(config)
+    db_book, input_authors, title_dir = create_book_on_upload(modify_date, meta)
+
+    # Save description / annotation
+    if meta.description:
+        modify_date |= edit_book_comments(Markup(meta.description).unescape(), db_book)
+
+    book_id = db_book.id
+
+    # Move book file into Calibre's folder structure: <Author>/<Title (id)>/<Title> - <Author>.<ext>
+    error = helper.update_dir_structure(
+        book_id,
+        config.get_book_path(),
+        input_authors[0],
+        meta.file_path,
+        title_dir + meta.extension.lower()
+    )
+    if error:
+        raise RuntimeError(f"Не удалось переместить файл книги в библиотеку: {error}")
+
+    # Move cover image if present
+    move_coverfile(meta, db_book)
+
+    if modify_date:
+        calibre_db.set_metadata_dirty(book_id)
+
+    calibre_db.session.commit()
+
+    try:
+        helper.add_book_to_thumbnail_cache(book_id)
+    except Exception:
+        pass
+
+    return db_book
+
+
+def generate_report_file(report_path, stats, errors, duplicates, added, args, config):
+    """Writes a comprehensive text report of the import run."""
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write("          ОТЧЁТ О ПАКЕТНОМ ИМПОРТЕ БИБЛИОТЕКИ В CALIBRE-WEB\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Дата и время:         {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Каталог импорта:      {args.import_dir}\n")
+        f.write(f"Каталог библиотеки:   {config.config_calibre_dir}\n")
+        f.write(f"Режим:                {'DRY-RUN (без записи в базу)' if args.dry_run else 'Штатный импорт'}\n")
+        f.write(f"Удаление исходников:  {'ВКЛЮЧЕНО (--delete-source)' if args.delete_source else 'ВЫКЛЮЧЕНО'}\n")
+        f.write("-" * 80 + "\n\n")
+
+        f.write("СТАТИСТИКА:\n")
+        f.write(f"  Всего обнаружено файлов/архивов: {stats['total_source_files']}\n")
+        f.write(f"  Всего обработано книг:           {stats['total_books_processed']}\n")
+        f.write(f"  Успешно добавлено в библиотеку:  {len(added)}\n")
+        f.write(f"  Пропущено дубликатов:            {len(duplicates)}\n")
+        f.write(f"  Ошибок при обработке:            {len(errors)}\n\n")
+
+        # ОШИБКИ
+        f.write("=" * 80 + "\n")
+        f.write(f"СПИСОК ОШИБОК ({len(errors)})\n")
+        f.write("=" * 80 + "\n")
+        if not errors:
+            f.write("Ошибок не обнаружено.\n\n")
+        else:
+            for idx, err in enumerate(errors, start=1):
+                f.write(f"{idx}. Файл: {err.get('source_file')}\n")
+                if err.get('book_title'):
+                    f.write(f"   Книга: {err.get('book_author', 'Неизвестен')} — {err.get('book_title')}\n")
+                f.write(f"   Этап: {err.get('stage')}\n")
+                f.write(f"   Причина: {err.get('error')}\n")
+                if err.get('traceback'):
+                    f.write(f"   Подробности:\n")
+                    for line in err['traceback'].strip().splitlines():
+                        f.write(f"     {line}\n")
+                f.write("\n")
+
+        # ДУБЛИКАТЫ
+        f.write("=" * 80 + "\n")
+        f.write(f"СПИСОК ДУБЛИКАТОВ ({len(duplicates)})\n")
+        f.write("=" * 80 + "\n")
+        if not duplicates:
+            f.write("Дубликатов не обнаружено.\n\n")
+        else:
+            for idx, dup in enumerate(duplicates, start=1):
+                f.write(f"{idx}. Книга: {dup['author']} — {dup['title']}\n")
+                if dup.get('series'):
+                    f.write(f"   Серия: {dup['series']}\n")
+                f.write(f"   Источник: {dup['source_file']}\n")
+                f.write(f"   Новый файл:       Формат {dup['new_format']}, размер {dup['new_size_str']} ({dup['new_size_bytes']} байт)\n")
+                
+                # Существующие форматы в библиотеке
+                existing_fmts = dup.get('existing_formats', [])
+                if existing_fmts:
+                    for ef in existing_fmts:
+                        f.write(f"   В библиотеке #{dup['existing_id']}: Формат {ef['format']}, размер {ef['size_str']} ({ef['size_bytes']} байт)\n")
+                        diff_bytes = dup['new_size_bytes'] - ef['size_bytes']
+                        if diff_bytes == 0:
+                            f.write(f"   Сравнение:        Размеры полностью совпадают\n")
+                        elif diff_bytes > 0:
+                            f.write(f"   Сравнение:        Новый файл БОЛЬШЕ на {format_size(diff_bytes)} (+{diff_bytes} байт)\n")
+                        else:
+                            f.write(f"   Сравнение:        Новый файл МЕНЬШЕ на {format_size(abs(diff_bytes))} (-{abs(diff_bytes)} байт)\n")
+                else:
+                    f.write(f"   В библиотеке: ID #{dup['existing_id']} (форматы не найдены)\n")
+                f.write("\n")
+
+        # ДОБАВЛЕННЫЕ КНИГИ
+        f.write("=" * 80 + "\n")
+        f.write(f"УСПЕШНО ДОБАВЛЕННЫЕ КНИГИ ({len(added)})\n")
+        f.write("=" * 80 + "\n")
+        if not added:
+            f.write("Новых книг не добавлено.\n\n")
+        else:
+            for idx, item in enumerate(added, start=1):
+                f.write(f"{idx}. [ID #{item.get('id', 'NEW')}] {item['author']} — {item['title']}\n")
+                if item.get('series'):
+                    f.write(f"   Серия: {item['series']}\n")
+                if item.get('genres'):
+                    f.write(f"   Жанры: {item['genres']}\n")
+                f.write(f"   Формат: {item['format']}, Размер: {item['size_str']}\n")
+                f.write(f"   Источник: {item['source_file']}\n\n")
+
+
+def scan_source_directory(import_dir):
+    """Scans directory recursively and groups files into archives and direct book files."""
+    files_to_process = []
+    for root, _, files in os.walk(import_dir):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in SUPPORTED_ARCHIVES or ext in SUPPORTED_DIRECT_BOOKS:
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, import_dir)
+                files_to_process.append((full_path, rel_path, ext))
+    files_to_process.sort(key=lambda x: x[1].lower())
+    return files_to_process
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Пакетный импорт книг и архивов в Calibre-Web с контролем дубликатов и размеров файлов.",
+        prog="import_library.py"
+    )
+    parser.add_argument("import_dir", help="Каталог с книгами/архивами для импорта (например /home/bookserver/import)")
+    parser.add_argument("-p", "--settings-path", help="Путь к app.db Calibre-Web (по умолчанию ищется в ~/.calibre-web/app.db)")
+    parser.add_argument("-c", "--calibre-dir", help="Путь к библиотеке Calibre с metadata.db (если отличается от app.db)")
+    parser.add_argument("--delete-source", action="store_true", help="Удалять исходный архив/файл после успешного импорта всех книг")
+    parser.add_argument("--dry-run", action="store_true", help="Тестовый прогон: сканирование и вывод без записи в базу и перемещения файлов")
+    parser.add_argument("--force", action="store_true", help="Продолжить работу даже если служба calibre-web запущена")
+    parser.add_argument("--report-file", help="Путь к файлу отчёта (по умолчанию: import_report_<timestamp>.txt)")
+
+    args = parser.parse_args()
+
+    import_dir = os.path.abspath(args.import_dir)
+    if not os.path.isdir(import_dir):
+        print(f"[!] Ошибка: Каталог импорта не существует: {import_dir}")
+        sys.exit(1)
+
+    # Проверка службы calibre-web
+    if not args.dry_run and is_service_running("calibre-web"):
+        print("\n" + "!" * 70)
+        print("ВНИМАНИЕ: Служба 'calibre-web' сейчас ЗАПУЩЕНА!")
+        print("Во избежание блокировок SQLite (database is locked) рекомендуется")
+        print("остановить службу на время импорта:")
+        print("    sudo systemctl stop calibre-web")
+        print("!" * 70 + "\n")
+        if not args.force:
+            try:
+                answer = input("Продолжить импорт несмотря на работающую службу? [y/N]: ").strip().lower()
+            except EOFError:
+                answer = "n"
+            if answer not in ["y", "yes", "да"]:
+                print("Импорт отменён. Остановите службу и запустите скрипт снова.")
+                sys.exit(0)
+
+    # Инициализация Calibre-Web
+    try:
+        config = init_calibre_web(args.settings_path, args.calibre_dir)
+    except Exception as e:
+        print(f"[!] Ошибка инициализации: {e}")
+        sys.exit(1)
+
+    from cps import app, calibre_db, helper, uploader, archive_helper
+    from cps.binary_helper import resolve_binary_path, SUPPORTED_UNRAR_BINARIES
+    rar_executable = resolve_binary_path(config.config_rarfile_location, SUPPORTED_UNRAR_BINARIES)
+
+    # Поиск файлов
+    print(f"[*] Сканирование каталога {import_dir}...")
+    source_files = scan_source_directory(import_dir)
+    total_files = len(source_files)
+    print(f"[*] Найдено подходящих файлов/архивов: {total_files}")
+
+    if total_files == 0:
+        print("[!] В указанном каталоге не найдено поддерживаемых книг или архивов (.zip, .fb2, .epub, etc.)")
+        sys.exit(0)
+
+    # Подготовка отчёта
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_file_path = args.report_file or os.path.join(os.getcwd(), f"import_report_{timestamp_str}.txt")
+
+    stats = {
+        'total_source_files': total_files,
+        'total_books_processed': 0,
+    }
+    errors = []
+    duplicates = []
+    added = []
+
+    print("\n" + "=" * 70)
+    print("НАЧАЛО ИМПОРТА" if not args.dry_run else "НАЧАЛО ТЕСТОВОГО ПРОГОНА (DRY-RUN)")
+    print("=" * 70 + "\n")
+
+    # Выполняем в контексте Flask приложения
+    with app.app_context(), app.test_request_context():
+        for file_idx, (full_path, rel_path, ext) in enumerate(source_files, start=1):
+            file_error_count = 0
+            books_in_file_count = 0
+
+            # ----------------------------------------------------
+            # Обработка ZIP архива
+            # ----------------------------------------------------
+            if ext in SUPPORTED_ARCHIVES:
+                temp_extract_dir = tempfile.mkdtemp(prefix="cw_imp_zip_")
+                try:
+                    try:
+                        extracted_books = archive_helper.extract_books_from_zip(full_path, temp_extract_dir)
+                    except Exception as e:
+                        file_error_count += 1
+                        error_entry = {
+                            'source_file': rel_path,
+                            'book_title': None,
+                            'book_author': None,
+                            'stage': 'zip_extraction',
+                            'error': str(e),
+                            'traceback': traceback.format_exc()
+                        }
+                        errors.append(error_entry)
+                        print(f"[{file_idx}/{total_files}] [ОШИБКА АРХИВА] {rel_path}: {e}")
+                        continue
+
+                    if not extracted_books:
+                        print(f"[{file_idx}/{total_files}] [ПРОПУСК] {rel_path}: Нет поддерживаемых книг в архиве")
+                        continue
+
+                    for book_item in extracted_books:
+                        stats['total_books_processed'] += 1
+                        books_in_file_count += 1
+                        inner_rel = f"{rel_path} -> {book_item.filename}{book_item.extension}"
+
+                        try:
+                            meta = uploader.process(
+                                book_item.path,
+                                book_item.filename,
+                                book_item.extension,
+                                rar_executable=rar_executable
+                            )
+                        except Exception as e:
+                            file_error_count += 1
+                            errors.append({
+                                'source_file': inner_rel,
+                                'book_title': book_item.filename,
+                                'book_author': None,
+                                'stage': 'metadata_extraction',
+                                'error': str(e),
+                                'traceback': traceback.format_exc()
+                            })
+                            print(f"[{file_idx}/{total_files}] [ОШИБКА МЕТАДАННЫХ] {inner_rel}: {e}")
+                            continue
+
+                        new_size = os.path.getsize(book_item.path)
+                        new_size_str = format_size(new_size)
+                        new_format = book_item.extension.upper().lstrip('.')
+
+                        # Проверка дубликата
+                        existing_book = calibre_db.check_exists_book(meta.author, meta.title)
+                        if existing_book:
+                            existing_formats = []
+                            for d in existing_book.data:
+                                existing_formats.append({
+                                    'format': d.format,
+                                    'size_bytes': d.uncompressed_size,
+                                    'size_str': format_size(d.uncompressed_size),
+                                    'name': d.name
+                                })
+
+                            duplicates.append({
+                                'title': meta.title,
+                                'author': meta.author,
+                                'series': f"{meta.series} #{meta.series_id}" if meta.series else "",
+                                'source_file': inner_rel,
+                                'new_format': new_format,
+                                'new_size_bytes': new_size,
+                                'new_size_str': new_size_str,
+                                'existing_id': existing_book.id,
+                                'existing_formats': existing_formats
+                            })
+
+                            # Форматируем сравнение размеров для консоли
+                            fmts_str = ", ".join(f"{ef['format']}: {ef['size_str']}" for ef in existing_formats)
+                            print(f"[{file_idx}/{total_files}] [ДУБЛИКАТ] {meta.author} — {meta.title}")
+                            print(f"         В библиотеке #{existing_book.id}: [{fmts_str}]")
+                            print(f"         Новый файл:          [{new_format}: {new_size_str}] ({inner_rel})")
+                            continue
+
+                        # Импорт книги (или dry-run)
+                        series_str = f" ({meta.series} #{meta.series_id})" if meta.series else ""
+                        genres_str = f" [{meta.tags}]" if meta.tags else ""
+                        if args.dry_run:
+                            added.append({
+                                'id': 'DRY-RUN',
+                                'title': meta.title,
+                                'author': meta.author,
+                                'series': series_str.strip(" ()"),
+                                'genres': meta.tags,
+                                'format': new_format,
+                                'size_str': new_size_str,
+                                'source_file': inner_rel
+                            })
+                            print(f"[{file_idx}/{total_files}] [DRY-RUN] {meta.author} — {meta.title}{series_str}{genres_str} [{new_format}: {new_size_str}]")
+                        else:
+                            try:
+                                db_book = import_single_book_to_db(meta, config, calibre_db, helper)
+                                added.append({
+                                    'id': db_book.id,
+                                    'title': db_book.title,
+                                    'author': meta.author,
+                                    'series': series_str.strip(" ()"),
+                                    'genres': meta.tags,
+                                    'format': new_format,
+                                    'size_str': new_size_str,
+                                    'source_file': inner_rel
+                                })
+                                print(f"[{file_idx}/{total_files}] [ДОБАВЛЕНО #{db_book.id}] {meta.author} — {meta.title}{series_str}{genres_str} [{new_format}: {new_size_str}]")
+                            except Exception as e:
+                                file_error_count += 1
+                                calibre_db.session.rollback()
+                                errors.append({
+                                    'source_file': inner_rel,
+                                    'book_title': meta.title,
+                                    'book_author': meta.author,
+                                    'stage': 'database_import',
+                                    'error': str(e),
+                                    'traceback': traceback.format_exc()
+                                })
+                                print(f"[{file_idx}/{total_files}] [ОШИБКА ИМПОРТА] {meta.author} — {meta.title}: {e}")
+
+                finally:
+                    # Очищаем временную папку распаковки архива
+                    shutil.rmtree(temp_extract_dir, ignore_errors=True)
+
+                # Удаление исходного архива, если запрошено и не было ошибок
+                if args.delete_source and not args.dry_run:
+                    if file_error_count == 0 and books_in_file_count > 0:
+                        try:
+                            os.unlink(full_path)
+                            print(f"         [УДАЛЁН ИСХОДНИК] {rel_path}")
+                        except OSError as ex:
+                            print(f"         [ПРЕДУПРЕЖДЕНИЕ] Не удалось удалить {rel_path}: {ex}")
+
+            # ----------------------------------------------------
+            # Прямой файл книги (.fb2, .epub, .mobi, .pdf и т.д.)
+            # ----------------------------------------------------
+            else:
+                stats['total_books_processed'] += 1
+                base_name = os.path.basename(full_path)
+                root_name, file_ext = os.path.splitext(base_name)
+
+                # Создаем временную копию файла, чтобы update_dir_structure переместил её, не трогая исходник
+                temp_book_dir = tempfile.mkdtemp(prefix="cw_imp_file_")
+                temp_book_path = os.path.join(temp_book_dir, base_name)
+                try:
+                    shutil.copyfile(full_path, temp_book_path)
+
+                    try:
+                        meta = uploader.process(
+                            temp_book_path,
+                            root_name,
+                            file_ext,
+                            rar_executable=rar_executable
+                        )
+                    except Exception as e:
+                        file_error_count += 1
+                        errors.append({
+                            'source_file': rel_path,
+                            'book_title': root_name,
+                            'book_author': None,
+                            'stage': 'metadata_extraction',
+                            'error': str(e),
+                            'traceback': traceback.format_exc()
+                        })
+                        print(f"[{file_idx}/{total_files}] [ОШИБКА МЕТАДАННЫХ] {rel_path}: {e}")
+                        continue
+
+                    new_size = os.path.getsize(temp_book_path)
+                    new_size_str = format_size(new_size)
+                    new_format = file_ext.upper().lstrip('.')
+
+                    # Проверка дубликата
+                    existing_book = calibre_db.check_exists_book(meta.author, meta.title)
+                    if existing_book:
+                        existing_formats = []
+                        for d in existing_book.data:
+                            existing_formats.append({
+                                'format': d.format,
+                                'size_bytes': d.uncompressed_size,
+                                'size_str': format_size(d.uncompressed_size),
+                                'name': d.name
+                            })
+
+                        duplicates.append({
+                            'title': meta.title,
+                            'author': meta.author,
+                            'series': f"{meta.series} #{meta.series_id}" if meta.series else "",
+                            'source_file': rel_path,
+                            'new_format': new_format,
+                            'new_size_bytes': new_size,
+                            'new_size_str': new_size_str,
+                            'existing_id': existing_book.id,
+                            'existing_formats': existing_formats
+                        })
+
+                        fmts_str = ", ".join(f"{ef['format']}: {ef['size_str']}" for ef in existing_formats)
+                        print(f"[{file_idx}/{total_files}] [ДУБЛИКАТ] {meta.author} — {meta.title}")
+                        print(f"         В библиотеке #{existing_book.id}: [{fmts_str}]")
+                        print(f"         Новый файл:          [{new_format}: {new_size_str}] ({rel_path})")
+                        continue
+
+                    # Импорт книги (или dry-run)
+                    series_str = f" ({meta.series} #{meta.series_id})" if meta.series else ""
+                    genres_str = f" [{meta.tags}]" if meta.tags else ""
+                    if args.dry_run:
+                        added.append({
+                            'id': 'DRY-RUN',
+                            'title': meta.title,
+                            'author': meta.author,
+                            'series': series_str.strip(" ()"),
+                            'genres': meta.tags,
+                            'format': new_format,
+                            'size_str': new_size_str,
+                            'source_file': rel_path
+                        })
+                        print(f"[{file_idx}/{total_files}] [DRY-RUN] {meta.author} — {meta.title}{series_str}{genres_str} [{new_format}: {new_size_str}]")
+                    else:
+                        try:
+                            db_book = import_single_book_to_db(meta, config, calibre_db, helper)
+                            added.append({
+                                'id': db_book.id,
+                                'title': db_book.title,
+                                'author': meta.author,
+                                'series': series_str.strip(" ()"),
+                                'genres': meta.tags,
+                                'format': new_format,
+                                'size_str': new_size_str,
+                                'source_file': rel_path
+                            })
+                            print(f"[{file_idx}/{total_files}] [ДОБАВЛЕНО #{db_book.id}] {meta.author} — {meta.title}{series_str}{genres_str} [{new_format}: {new_size_str}]")
+                        except Exception as e:
+                            file_error_count += 1
+                            calibre_db.session.rollback()
+                            errors.append({
+                                'source_file': rel_path,
+                                'book_title': meta.title,
+                                'book_author': meta.author,
+                                'stage': 'database_import',
+                                'error': str(e),
+                                'traceback': traceback.format_exc()
+                            })
+                            print(f"[{file_idx}/{total_files}] [ОШИБКА ИМПОРТА] {meta.author} — {meta.title}: {e}")
+
+                finally:
+                    shutil.rmtree(temp_book_dir, ignore_errors=True)
+
+                # Удаление исходного файла
+                if args.delete_source and not args.dry_run:
+                    if file_error_count == 0:
+                        try:
+                            os.unlink(full_path)
+                            print(f"         [УДАЛЁН ИСХОДНИК] {rel_path}")
+                        except OSError as ex:
+                            print(f"         [ПРЕДУПРЕЖДЕНИЕ] Не удалось удалить {rel_path}: {ex}")
+
+    # Генерация отчёта
+    try:
+        generate_report_file(report_file_path, stats, errors, duplicates, added, args, config)
+    except Exception as e:
+        print(f"\n[!] Не удалось сохранить отчёт в {report_file_path}: {e}")
+
+    # Итоговый вывод
+    print("\n" + "=" * 70)
+    print("ИТОГИ ИМПОРТА" if not args.dry_run else "ИТОГИ ТЕСТОВОГО ПРОГОНА (DRY-RUN)")
+    print("=" * 70)
+    print(f"Всего проверено файлов/архивов: {stats['total_source_files']}")
+    print(f"Всего обработано книг:          {stats['total_books_processed']}")
+    print(f"Успешно добавлено в библиотеку: {len(added)}")
+    print(f"Пропущено дубликатов:           {len(duplicates)}")
+    print(f"Ошибок при обработке:           {len(errors)}")
+    print("-" * 70)
+    print(f"Подробный отчёт сохранён в файл:\n{report_file_path}")
+    print("=" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    main()
