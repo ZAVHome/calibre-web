@@ -150,6 +150,13 @@ def init_calibre_web(settings_path=None, calibre_dir=None):
     config_sql.load_configuration(ub.session, encrypt_key)
     config.init_config(ub.session, encrypt_key, cli_param)
 
+    # Initialize LoginManager and authentication extensions
+    from cps import lm
+    import cps.usermanagement
+    lm.login_view = 'web.login'
+    lm.anonymous_user = ub.Anonymous
+    lm.init_app(app)
+
     # Initialize Flask-Babel extension on app so uploader and gettext _() work
     app.secret_key = os.getenv('SECRET_KEY', config_sql.get_flask_session_key(ub.session))
     if 'babel' not in app.extensions:
@@ -401,6 +408,16 @@ def main():
 
     # Выполняем в контексте Flask приложения
     with app.app_context(), app.test_request_context():
+        from flask import g
+        from cps import constants, ub
+        try:
+            admin_user = ub.session.query(ub.User).filter(ub.User.role.op('&')(constants.ROLE_ADMIN) == constants.ROLE_ADMIN).first()
+            g._login_user = admin_user if admin_user else ub.Anonymous()
+        except Exception:
+            try:
+                g._login_user = ub.Anonymous()
+            except Exception:
+                pass
         for file_idx, (full_path, rel_path, ext) in enumerate(source_files, start=1):
             file_error_count = 0
             books_in_file_count = 0
