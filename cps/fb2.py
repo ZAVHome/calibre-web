@@ -23,6 +23,7 @@ from lxml import etree
 
 from .constants import BookMeta
 from . import isoLanguages, cover, logger
+from .fb2_genres import get_genre_name
 
 log = logger.create()
 
@@ -143,7 +144,12 @@ def get_fb2_info(tmp_file_path, original_file_extension, no_cover=False):
     genre_nodes = tree.xpath('//fb:description/fb:title-info/fb:genre/text()', namespaces=ns)
     if not genre_nodes:
         genre_nodes = tree.xpath('//*[local-name()="title-info"]/*[local-name()="genre"]/text()')
-    tags = ', '.join([g.strip() for g in genre_nodes if g.strip()])
+    genre_list = []
+    for g in genre_nodes:
+        name = get_genre_name(g.strip())
+        if name and name not in genre_list:
+            genre_list.append(name)
+    tags = ', '.join(genre_list)
 
     # 7. Publisher and Date
     publisher_nodes = tree.xpath('//fb:description/fb:publish-info/fb:publisher/text()', namespaces=ns)

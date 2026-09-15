@@ -31,6 +31,7 @@ from flask import Blueprint, request, url_for, g
 from flask_babel import format_date
 from .cw_login import current_user
 from .clean_html import clean_string as html_clean_string
+from .fb2_genres import get_genre_name
 
 from . import constants, logger
 
@@ -186,5 +187,10 @@ def contains_music(book_formats):
 @jinjia.app_template_filter('clean_string')
 def clean_string(unsafe_text):
     return html_clean_string(unsafe_text)
+
+
+@jinjia.app_template_filter('format_genre')
+def format_genre(tag_name):
+    return get_genre_name(tag_name)
 
 

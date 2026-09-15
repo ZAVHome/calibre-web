@@ -60,8 +60,8 @@
     {% endfor %}
     {% for tag in entry.Books.tags %}
     <category scheme="http://www.bisg.org/standards/bisac_subject/index.html"
-              term="{{tag.name}}"
-              label="{{tag.name}}"/>
+              term="{{tag.name|format_genre}}"
+              label="{{tag.name|format_genre}}"/>
     {% endfor %}
     {% if entry.Books.series.__len__() > 0 %}
       <calibre:series>{{entry.Books.series[0].name}}</calibre:series>
