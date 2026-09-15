@@ -37,31 +37,43 @@ def is_zip_file(file_path):
 def decode_zip_filename(zip_info):
     """
     Decodes the filename in ZipInfo, taking into account UTF-8 flags,
-    as well as Russian DOS (CP866) and Windows (CP1251) encodings.
+    as well as Russian DOS (CP866) and Windows (CP1251) encodings,
+    and removes any surrogate characters.
     """
     filename = zip_info.filename
-    if zip_info.flag_bits & 0x800:
-        return filename
+    if not (zip_info.flag_bits & 0x800):
+        try:
+            raw_bytes = filename.encode('cp437')
+            # Try UTF-8 first
+            try:
+                filename = raw_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                # Try CP866 (classic Russian ZIP encoding)
+                try:
+                    filename = raw_bytes.decode('cp866')
+                except UnicodeDecodeError:
+                    # Try CP1251
+                    try:
+                        filename = raw_bytes.decode('cp1251')
+                    except UnicodeDecodeError:
+                        pass
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
 
-    try:
-        raw_bytes = filename.encode('cp437')
-        # Try UTF-8 first
+    # Heal or replace any lone surrogates in filename
+    if any(0xD800 <= ord(c) <= 0xDFFF for c in filename):
         try:
-            return raw_bytes.decode('utf-8')
-        except UnicodeDecodeError:
+            raw = filename.encode('utf-8', errors='surrogateescape')
+            for enc in ('cp1251', 'cp866', 'iso-8859-5'):
+                try:
+                    candidate = raw.decode(enc)
+                    if not any(0xD800 <= ord(c) <= 0xDFFF for c in candidate):
+                        return candidate
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+        except Exception:
             pass
-        # Try CP866 (classic Russian ZIP encoding)
-        try:
-            return raw_bytes.decode('cp866')
-        except UnicodeDecodeError:
-            pass
-        # Try CP1251
-        try:
-            return raw_bytes.decode('cp1251')
-        except UnicodeDecodeError:
-            pass
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        pass
+        return filename.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
 
     return filename
 
@@ -130,22 +142,8 @@ def extract_books_from_zip(zip_path, target_dir):
                 base_name = os.path.basename(decoded_name)
                 root_name, ext = os.path.splitext(base_name)
 
-                # Ensure safe destination path inside target_dir (prevent Zip Slip)
-                safe_name = "".join(c for c in base_name if c not in '<>:"/\\|?*')
-                if not safe_name:
-                    safe_name = f"book_{len(books) + 1}{ext.lower()}"
-
-                dest_path = os.path.join(real_target_dir, safe_name)
-                # Avoid filename collisions in multi-book archives
-                counter = 1
-                while os.path.exists(dest_path):
-                    dest_path = os.path.join(real_target_dir, f"{root_name}_{counter}{ext.lower()}")
-                    counter += 1
-
-                # Safety check against path traversal
-                if not os.path.abspath(dest_path).startswith(real_target_dir):
-                    log.warning("Skipping malicious zip entry: %s", decoded_name)
-                    continue
+                # Ensure safe destination path inside target_dir (clean ASCII, no Zip Slip or encoding issues)
+                dest_path = os.path.join(real_target_dir, f"extracted_{len(books) + 1}{ext.lower()}")
 
                 with zf.open(info) as src, open(dest_path, 'wb') as dst:
                     shutil.copyfileobj(src, dst)

@@ -50,18 +50,43 @@ def safe_str(s):
     if not s:
         return ""
     s_val = str(s)
-    if any('\udc80' <= ch <= '\udcff' for ch in s_val):
+    if any(0xD800 <= ord(ch) <= 0xDFFF for ch in s_val):
         try:
             raw = s_val.encode('utf-8', errors='surrogateescape')
             for enc in ('cp1251', 'cp866', 'iso-8859-5'):
                 try:
-                    return raw.decode(enc)
-                except UnicodeDecodeError:
+                    candidate = raw.decode(enc)
+                    if not any(0xD800 <= ord(c) <= 0xDFFF for c in candidate):
+                        return candidate
+                except (UnicodeDecodeError, UnicodeEncodeError):
                     pass
         except Exception:
             pass
         return s_val.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
     return s_val
+
+
+def sanitize_meta(meta):
+    """Ensures all string attributes in BookMeta are clean, valid UTF-8 strings without surrogate escapes."""
+    if not meta:
+        return meta
+    clean_title = safe_str(meta.title or "").strip()
+    clean_author = safe_str(meta.author or "").strip()
+    if not clean_title:
+        clean_title = "Unknown"
+    if not clean_author:
+        clean_author = "Unknown"
+
+    return meta._replace(
+        title=clean_title,
+        author=clean_author,
+        series=safe_str(meta.series or ""),
+        series_id=safe_str(meta.series_id or ""),
+        description=safe_str(meta.description or ""),
+        tags=safe_str(meta.tags or ""),
+        publisher=safe_str(meta.publisher or ""),
+        languages=safe_str(meta.languages or "")
+    )
 
 
 def is_service_running(service_name="calibre-web"):
@@ -414,75 +439,65 @@ def main():
                         try:
                             meta = uploader.process(
                                 book_item.path,
-                                book_item.filename,
-                                book_item.extension,
+                                safe_str(book_item.filename),
+                                safe_str(book_item.extension),
                                 rar_executable=rar_executable
                             )
-                        except Exception as e:
-                            file_error_count += 1
-                            errors.append({
-                                'source_file': inner_rel,
-                                'book_title': safe_str(book_item.filename),
-                                'book_author': None,
-                                'stage': 'metadata_extraction',
-                                'error': str(e),
-                                'traceback': traceback.format_exc()
-                            })
-                            print(f"[{file_idx}/{total_files}] [ОШИБКА МЕТАДАННЫХ] {inner_rel}: {e}")
-                            continue
+                            meta = sanitize_meta(meta)
 
-                        new_size = os.path.getsize(book_item.path)
-                        new_size_str = format_size(new_size)
-                        new_format = book_item.extension.upper().lstrip('.')
+                            new_size = os.path.getsize(book_item.path)
+                            new_size_str = format_size(new_size)
+                            new_format = book_item.extension.upper().lstrip('.')
 
-                        # Проверка дубликата
-                        existing_book = calibre_db.check_exists_book(meta.author, meta.title)
-                        if existing_book:
-                            existing_formats = []
-                            for d in existing_book.data:
-                                existing_formats.append({
-                                    'format': d.format,
-                                    'size_bytes': d.uncompressed_size,
-                                    'size_str': format_size(d.uncompressed_size),
-                                    'name': safe_str(d.name)
+                            # Проверка дубликата
+                            existing_book = None
+                            if meta.author and meta.title and meta.title.lower() != 'unknown':
+                                existing_book = calibre_db.check_exists_book(meta.author, meta.title)
+                            if existing_book:
+                                existing_formats = []
+                                for d in existing_book.data:
+                                    existing_formats.append({
+                                        'format': d.format,
+                                        'size_bytes': d.uncompressed_size,
+                                        'size_str': format_size(d.uncompressed_size),
+                                        'name': safe_str(d.name)
+                                    })
+
+                                duplicates.append({
+                                    'title': safe_str(meta.title),
+                                    'author': safe_str(meta.author),
+                                    'series': safe_str(f"{meta.series} #{meta.series_id}") if meta.series else "",
+                                    'source_file': inner_rel,
+                                    'new_format': new_format,
+                                    'new_size_bytes': new_size,
+                                    'new_size_str': new_size_str,
+                                    'existing_id': existing_book.id,
+                                    'existing_formats': existing_formats
                                 })
 
-                            duplicates.append({
-                                'title': safe_str(meta.title),
-                                'author': safe_str(meta.author),
-                                'series': safe_str(f"{meta.series} #{meta.series_id}") if meta.series else "",
-                                'source_file': inner_rel,
-                                'new_format': new_format,
-                                'new_size_bytes': new_size,
-                                'new_size_str': new_size_str,
-                                'existing_id': existing_book.id,
-                                'existing_formats': existing_formats
-                            })
+                                # Форматируем сравнение размеров для консоли
+                                fmts_str = ", ".join(f"{ef['format']}: {ef['size_str']}" for ef in existing_formats)
+                                print(f"[{file_idx}/{total_files}] [ДУБЛИКАТ] {safe_str(meta.author)} — {safe_str(meta.title)}")
+                                print(f"         В библиотеке #{existing_book.id}: [{fmts_str}]")
+                                print(f"         Новый файл:          [{new_format}: {new_size_str}] ({inner_rel})")
+                                continue
 
-                            # Форматируем сравнение размеров для консоли
-                            fmts_str = ", ".join(f"{ef['format']}: {ef['size_str']}" for ef in existing_formats)
-                            print(f"[{file_idx}/{total_files}] [ДУБЛИКАТ] {safe_str(meta.author)} — {safe_str(meta.title)}")
-                            print(f"         В библиотеке #{existing_book.id}: [{fmts_str}]")
-                            print(f"         Новый файл:          [{new_format}: {new_size_str}] ({inner_rel})")
-                            continue
-
-                        # Импорт книги (или dry-run)
-                        series_str = f" ({safe_str(meta.series)} #{meta.series_id})" if meta.series else ""
-                        genres_str = f" [{safe_str(meta.tags)}]" if meta.tags else ""
-                        if args.dry_run:
-                            added.append({
-                                'id': 'DRY-RUN',
-                                'title': safe_str(meta.title),
-                                'author': safe_str(meta.author),
-                                'series': series_str.strip(" ()"),
-                                'genres': safe_str(meta.tags),
-                                'format': new_format,
-                                'size_str': new_size_str,
-                                'source_file': inner_rel
-                            })
-                            print(f"[{file_idx}/{total_files}] [DRY-RUN] {safe_str(meta.author)} — {safe_str(meta.title)}{series_str}{genres_str} [{new_format}: {new_size_str}]")
-                        else:
-                            try:
+                            # Импорт книги (или dry-run)
+                            series_str = f" ({safe_str(meta.series)} #{meta.series_id})" if meta.series else ""
+                            genres_str = f" [{safe_str(meta.tags)}]" if meta.tags else ""
+                            if args.dry_run:
+                                added.append({
+                                    'id': 'DRY-RUN',
+                                    'title': safe_str(meta.title),
+                                    'author': safe_str(meta.author),
+                                    'series': series_str.strip(" ()"),
+                                    'genres': safe_str(meta.tags),
+                                    'format': new_format,
+                                    'size_str': new_size_str,
+                                    'source_file': inner_rel
+                                })
+                                print(f"[{file_idx}/{total_files}] [DRY-RUN] {safe_str(meta.author)} — {safe_str(meta.title)}{series_str}{genres_str} [{new_format}: {new_size_str}]")
+                            else:
                                 db_book = import_single_book_to_db(meta, config, calibre_db, helper)
                                 added.append({
                                     'id': db_book.id,
@@ -495,18 +510,18 @@ def main():
                                     'source_file': inner_rel
                                 })
                                 print(f"[{file_idx}/{total_files}] [ДОБАВЛЕНО #{db_book.id}] {safe_str(meta.author)} — {safe_str(meta.title)}{series_str}{genres_str} [{new_format}: {new_size_str}]")
-                            except Exception as e:
-                                file_error_count += 1
-                                calibre_db.session.rollback()
-                                errors.append({
-                                    'source_file': inner_rel,
-                                    'book_title': safe_str(meta.title),
-                                    'book_author': safe_str(meta.author),
-                                    'stage': 'database_import',
-                                    'error': str(e),
-                                    'traceback': traceback.format_exc()
-                                })
-                                print(f"[{file_idx}/{total_files}] [ОШИБКА ИМПОРТА] {safe_str(meta.author)} — {safe_str(meta.title)}: {e}")
+                        except Exception as e:
+                            file_error_count += 1
+                            calibre_db.session.rollback()
+                            errors.append({
+                                'source_file': inner_rel,
+                                'book_title': safe_str(getattr(meta, 'title', None) if 'meta' in locals() else book_item.filename),
+                                'book_author': safe_str(getattr(meta, 'author', None) if 'meta' in locals() else None),
+                                'stage': 'book_processing',
+                                'error': str(e),
+                                'traceback': traceback.format_exc()
+                            })
+                            print(f"[{file_idx}/{total_files}] [ОШИБКА] {inner_rel}: {e}")
 
                 finally:
                     # Очищаем временную папку распаковки архива
@@ -528,84 +543,75 @@ def main():
                 stats['total_books_processed'] += 1
                 base_name = os.path.basename(full_path)
                 root_name, file_ext = os.path.splitext(base_name)
+                safe_file_rel = safe_str(rel_path)
 
-                # Создаем временную копию файла, чтобы update_dir_structure переместил её, не трогая исходник
+                # Создаем временную копию файла с безопасным именем
                 temp_book_dir = tempfile.mkdtemp(prefix="cw_imp_file_")
-                temp_book_path = os.path.join(temp_book_dir, base_name)
+                temp_book_path = os.path.join(temp_book_dir, f"source_book{file_ext.lower()}")
                 try:
                     shutil.copyfile(full_path, temp_book_path)
 
                     try:
                         meta = uploader.process(
                             temp_book_path,
-                            root_name,
-                            file_ext,
+                            safe_str(root_name),
+                            safe_str(file_ext),
                             rar_executable=rar_executable
                         )
-                    except Exception as e:
-                        file_error_count += 1
-                        errors.append({
-                            'source_file': safe_str(rel_path),
-                            'book_title': safe_str(root_name),
-                            'book_author': None,
-                            'stage': 'metadata_extraction',
-                            'error': str(e),
-                            'traceback': traceback.format_exc()
-                        })
-                        print(f"[{file_idx}/{total_files}] [ОШИБКА МЕТАДАННЫХ] {safe_str(rel_path)}: {e}")
-                        continue
+                        meta = sanitize_meta(meta)
 
-                    new_size = os.path.getsize(temp_book_path)
-                    new_size_str = format_size(new_size)
-                    new_format = file_ext.upper().lstrip('.')
+                        new_size = os.path.getsize(temp_book_path)
+                        new_size_str = format_size(new_size)
+                        new_format = file_ext.upper().lstrip('.')
 
-                    # Проверка дубликата
-                    existing_book = calibre_db.check_exists_book(meta.author, meta.title)
-                    if existing_book:
-                        existing_formats = []
-                        for d in existing_book.data:
-                            existing_formats.append({
-                                'format': d.format,
-                                'size_bytes': d.uncompressed_size,
-                                'size_str': format_size(d.uncompressed_size),
-                                'name': safe_str(d.name)
+                        # Проверка дубликата
+                        existing_book = None
+                        if meta.author and meta.title and meta.title.lower() != 'unknown':
+                            existing_book = calibre_db.check_exists_book(meta.author, meta.title)
+                        if existing_book:
+                            existing_formats = []
+                            for d in existing_book.data:
+                                existing_formats.append({
+                                    'format': d.format,
+                                    'size_bytes': d.uncompressed_size,
+                                    'size_str': format_size(d.uncompressed_size),
+                                    'name': safe_str(d.name)
+                                })
+
+                            duplicates.append({
+                                'title': safe_str(meta.title),
+                                'author': safe_str(meta.author),
+                                'series': safe_str(f"{meta.series} #{meta.series_id}") if meta.series else "",
+                                'source_file': safe_file_rel,
+                                'new_format': new_format,
+                                'new_size_bytes': new_size,
+                                'new_size_str': new_size_str,
+                                'existing_id': existing_book.id,
+                                'existing_formats': existing_formats
                             })
 
-                        duplicates.append({
-                            'title': safe_str(meta.title),
-                            'author': safe_str(meta.author),
-                            'series': safe_str(f"{meta.series} #{meta.series_id}") if meta.series else "",
-                            'source_file': safe_str(rel_path),
-                            'new_format': new_format,
-                            'new_size_bytes': new_size,
-                            'new_size_str': new_size_str,
-                            'existing_id': existing_book.id,
-                            'existing_formats': existing_formats
-                        })
+                            fmts_str = ", ".join(f"{ef['format']}: {ef['size_str']}" for ef in existing_formats)
+                            print(f"[{file_idx}/{total_files}] [ДУБЛИКАТ] {safe_str(meta.author)} — {safe_str(meta.title)}")
+                            print(f"         В библиотеке #{existing_book.id}: [{fmts_str}]")
+                            print(f"         Новый файл:          [{new_format}: {new_size_str}] ({safe_file_rel})")
+                            continue
 
-                        fmts_str = ", ".join(f"{ef['format']}: {ef['size_str']}" for ef in existing_formats)
-                        print(f"[{file_idx}/{total_files}] [ДУБЛИКАТ] {safe_str(meta.author)} — {safe_str(meta.title)}")
-                        print(f"         В библиотеке #{existing_book.id}: [{fmts_str}]")
-                        print(f"         Новый файл:          [{new_format}: {new_size_str}] ({safe_str(rel_path)})")
-                        continue
-
-                    # Импорт книги (или dry-run)
-                    series_str = f" ({safe_str(meta.series)} #{meta.series_id})" if meta.series else ""
-                    genres_str = f" [{safe_str(meta.tags)}]" if meta.tags else ""
-                    if args.dry_run:
-                        added.append({
-                            'id': 'DRY-RUN',
-                            'title': safe_str(meta.title),
-                            'author': safe_str(meta.author),
-                            'series': series_str.strip(" ()"),
-                            'genres': safe_str(meta.tags),
-                            'format': new_format,
-                            'size_str': new_size_str,
-                            'source_file': safe_str(rel_path)
-                        })
-                        print(f"[{file_idx}/{total_files}] [DRY-RUN] {safe_str(meta.author)} — {safe_str(meta.title)}{series_str}{genres_str} [{new_format}: {new_size_str}]")
-                    else:
-                        try:
+                        # Импорт книги (или dry-run)
+                        series_str = f" ({safe_str(meta.series)} #{meta.series_id})" if meta.series else ""
+                        genres_str = f" [{safe_str(meta.tags)}]" if meta.tags else ""
+                        if args.dry_run:
+                            added.append({
+                                'id': 'DRY-RUN',
+                                'title': safe_str(meta.title),
+                                'author': safe_str(meta.author),
+                                'series': series_str.strip(" ()"),
+                                'genres': safe_str(meta.tags),
+                                'format': new_format,
+                                'size_str': new_size_str,
+                                'source_file': safe_file_rel
+                            })
+                            print(f"[{file_idx}/{total_files}] [DRY-RUN] {safe_str(meta.author)} — {safe_str(meta.title)}{series_str}{genres_str} [{new_format}: {new_size_str}]")
+                        else:
                             db_book = import_single_book_to_db(meta, config, calibre_db, helper)
                             added.append({
                                 'id': db_book.id,
@@ -615,21 +621,21 @@ def main():
                                 'genres': safe_str(meta.tags),
                                 'format': new_format,
                                 'size_str': new_size_str,
-                                'source_file': safe_str(rel_path)
+                                'source_file': safe_file_rel
                             })
                             print(f"[{file_idx}/{total_files}] [ДОБАВЛЕНО #{db_book.id}] {safe_str(meta.author)} — {safe_str(meta.title)}{series_str}{genres_str} [{new_format}: {new_size_str}]")
-                        except Exception as e:
-                            file_error_count += 1
-                            calibre_db.session.rollback()
-                            errors.append({
-                                'source_file': safe_str(rel_path),
-                                'book_title': safe_str(meta.title),
-                                'book_author': safe_str(meta.author),
-                                'stage': 'database_import',
-                                'error': str(e),
-                                'traceback': traceback.format_exc()
-                            })
-                            print(f"[{file_idx}/{total_files}] [ОШИБКА ИМПОРТА] {safe_str(meta.author)} — {safe_str(meta.title)}: {e}")
+                    except Exception as e:
+                        file_error_count += 1
+                        calibre_db.session.rollback()
+                        errors.append({
+                            'source_file': safe_file_rel,
+                            'book_title': safe_str(getattr(meta, 'title', None) if 'meta' in locals() else root_name),
+                            'book_author': safe_str(getattr(meta, 'author', None) if 'meta' in locals() else None),
+                            'stage': 'book_processing',
+                            'error': str(e),
+                            'traceback': traceback.format_exc()
+                        })
+                        print(f"[{file_idx}/{total_files}] [ОШИБКА] {safe_file_rel}: {e}")
 
                 finally:
                     shutil.rmtree(temp_book_dir, ignore_errors=True)
@@ -639,9 +645,9 @@ def main():
                     if file_error_count == 0:
                         try:
                             os.unlink(full_path)
-                            print(f"         [УДАЛЁН ИСХОДНИК] {safe_str(rel_path)}")
+                            print(f"         [УДАЛЁН ИСХОДНИК] {safe_file_rel}")
                         except OSError as ex:
-                            print(f"         [ПРЕДУПРЕЖДЕНИЕ] Не удалось удалить {safe_str(rel_path)}: {ex}")
+                            print(f"         [ПРЕДУПРЕЖДЕНИЕ] Не удалось удалить {safe_file_rel}: {ex}")
 
     # Генерация отчёта
     try:
